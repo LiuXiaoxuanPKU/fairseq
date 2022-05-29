@@ -30,6 +30,10 @@ from fairseq.nan_detector import NanDetector
 from fairseq.optim import lr_scheduler
 from fairseq.utils import safe_hasattr
 
+import actnn
+from actnn.utils import get_memory_usage, compute_tensor_bytes, exp_recorder
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -783,6 +787,22 @@ class Trainer(object):
         self.criterion.train()
         self.zero_grad()
 
+        bz = 0
+        torch.cuda.max_memory_allocated()
+        if self.cfg.actnn.alg in ["L1", "swap"]:
+            print("===========Register ActNN===========")
+            actnn.set_optimization_level(self.cfg.actnn.alg)
+            controller = actnn.controller.Controller(self.model)
+
+            def pack_hook(input):
+                return controller.quantize(input)
+
+            def unpack_hook(input):
+                return controller.dequantize(input)
+                
+            torch._C._autograd._register_saved_tensors_default_hooks(
+                    pack_hook, unpack_hook)
+
         metrics.log_start_time("train_wall", priority=800, round=0)
 
         # If EMA is enabled through store_ema=True
@@ -818,6 +838,7 @@ class Trainer(object):
                     return contextlib.ExitStack()  # dummy contextmanager
 
             try:
+                bz = sample["nsentences"] 
                 with maybe_no_sync():
                     # forward and backward
                     loss, sample_size_i, logging_output = self.task.train_step(
@@ -850,6 +871,7 @@ class Trainer(object):
                     self.zero_grad()
                     if self.cuda:
                         torch.cuda.empty_cache()
+                    exit(-1)
                     if self.cfg.distributed_training.distributed_world_size == 1:
                         return None
                 else:
@@ -1092,7 +1114,20 @@ class Trainer(object):
                 weight=0,
             )
 
-        metrics.log_stop_time("train_wall")
+        metrics.log_stop_time("train_wall", 1)
+        m = metrics.get_meter("train", "train_wall") 
+        if m.n == 5 and self.data_parallel_rank == 0:
+            peak_mem = torch.cuda.max_memory_allocated()
+            exp_recorder.record("network", self.cfg.actnn.arch)
+            exp_recorder.record("alg", self.cfg.actnn.alg)
+            exp_recorder.record("batch_size", bz)
+            exp_recorder.record("peak_mem", peak_mem)
+            exp_recorder.record("ips", bz /m.avg, 2)
+            exp_recorder.record("batch_time", m.avg)
+            exp_recorder.record("tstamp", time.time(), 2)
+            exp_recorder.dump('results/speed_results.json')
+        if m.n == 5:
+            exit(0)
         return logging_output
 
     @metrics.aggregate("valid")
